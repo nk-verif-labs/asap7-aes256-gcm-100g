@@ -1,0 +1,24 @@
+name: CI - Cocotb Dual-Sim (ASAP7 AES-256-GCM)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  cocotb-sim:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        sim: [icarus, verilator]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Simulators & Cocotb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iverilog verilator python3-pip
+          pip install --break-system-packages cocotb==1.9.2 pytest
+      - name: Run Cocotb (${{ matrix.sim }})
+        working-directory: tb
+        run: make SIM=${{ matrix.sim }}
