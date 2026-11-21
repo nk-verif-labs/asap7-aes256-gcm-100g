@@ -1,8 +1,3 @@
-// ============================================================================
-// Module: aes256_pipe
-// Description: 14-Stage Pipelined AES-256 Encryption Core + Key Expansion
-//              Sustains 128 bits/cycle (128 Gbps @ 1.0 GHz on ASAP7).
-// ============================================================================
 `timescale 1ns / 1ps
 
 module aes256_round (
@@ -29,7 +24,6 @@ module aes256_round (
         end
     endgenerate
 
-    // ShiftRows (byte 0 = [127:120], byte 15 = [7:0])
     wire [7:0] s0  = sub_bytes[127:120]; wire [7:0] s1  = sub_bytes[119:112];
     wire [7:0] s2  = sub_bytes[111:104]; wire [7:0] s3  = sub_bytes[103:96];
     wire [7:0] s4  = sub_bytes[95:88];   wire [7:0] s5  = sub_bytes[87:80];
@@ -46,7 +40,6 @@ module aes256_round (
         s12, s1, s6, s11
     };
 
-    // MixColumns
     reg [127:0] mix_cols;
     integer c;
     reg [7:0] a0, a1, a2, a3;
@@ -76,14 +69,16 @@ module aes256_pipe (
 
     input  wire [127:0] block_in,
     input  wire [127:0] aux_in,
+    input  wire         last_in,
     input  wire         valid_in,
+    output wire         busy,
 
-    output wire [127:0] block_out,
-    output wire [127:0] aux_out,
-    output wire         valid_out
+    output reg  [127:0] block_out,
+    output reg  [127:0] aux_out,
+    output reg          last_out,
+    output reg          valid_out
 );
 
-    // Key Expansion Storage: 60 32-bit words (15 round keys x 128 bits)
     reg [31:0] w [0:59];
     reg [5:0]  kidx;
     reg        kbusy;
@@ -117,75 +112,64 @@ module aes256_pipe (
     integer wi;
     always @(posedge clk) begin
         if (!rst_n) begin
-            key_ready <= 1'b0;
-            kbusy     <= 1'b0;
-            kidx      <= 6'd0;
+            key_ready <= 1'b0; kbusy <= 1'b0; kidx <= 6'd0;
             for (wi = 0; wi < 60; wi = wi + 1) w[wi] <= 32'd0;
         end else if (key_start) begin
             w[0] <= key_in[255:224]; w[1] <= key_in[223:192];
             w[2] <= key_in[191:160]; w[3] <= key_in[159:128];
             w[4] <= key_in[127:96];  w[5] <= key_in[95:64];
             w[6] <= key_in[63:32];   w[7] <= key_in[31:0];
-            kidx      <= 6'd8;
-            kbusy     <= 1'b1;
-            key_ready <= 1'b0;
+            kidx <= 6'd8; kbusy <= 1'b1; key_ready <= 1'b0;
         end else if (kbusy) begin
             w[kidx] <= kw_m8 ^ k_sub;
             if (kidx == 6'd59) begin
-                kbusy     <= 1'b0;
-                key_ready <= 1'b1;
-            end else begin
-                kidx <= kidx + 6'd1;
-            end
+                kbusy <= 1'b0; key_ready <= 1'b1;
+            end else kidx <= kidx + 6'd1;
         end
     end
 
-    // 14-Stage Pipelined Encryption Datapath
-    reg [127:0] st_q   [0:14];
-    reg [127:0] aux_q  [0:14];
-    reg         vld_q  [0:14];
-    wire [127:0] rnd_out [1:14];
+    reg [127:0] st_q, aux_q;
+    reg         last_q, rnd_busy;
+    reg [3:0]   rnd_cnt;
 
     wire [127:0] rk0 = {w[0], w[1], w[2], w[3]};
+    wire [127:0] rkr = {w[{rnd_cnt, 2'd0}], w[{rnd_cnt, 2'd1}], w[{rnd_cnt, 2'd2}], w[{rnd_cnt, 2'd3}]};
+    wire [127:0] rnd_out;
+
+    aes256_round u_rnd (
+        .state_in (st_q),
+        .rkey     (rkr),
+        .is_last  (rnd_cnt == 4'd14),
+        .state_out(rnd_out)
+    );
+
+    assign busy = rnd_busy;
 
     always @(posedge clk) begin
         if (!rst_n) begin
-            st_q[0]  <= 128'd0;
-            aux_q[0] <= 128'd0;
-            vld_q[0] <= 1'b0;
+            st_q <= 128'd0; aux_q <= 128'd0; last_q <= 1'b0;
+            rnd_busy <= 1'b0; rnd_cnt <= 4'd0;
+            block_out <= 128'd0; aux_out <= 128'd0; last_out <= 1'b0; valid_out <= 1'b0;
         end else begin
-            st_q[0]  <= block_in ^ rk0;
-            aux_q[0] <= aux_in;
-            vld_q[0] <= valid_in;
-        end
-    end
-
-    genvar r;
-    generate
-        for (r = 1; r <= 14; r = r + 1) begin : gen_rnd
-            wire [127:0] rkr = {w[4*r], w[4*r+1], w[4*r+2], w[4*r+3]};
-            aes256_round u_rnd (
-                .state_in (st_q[r-1]),
-                .rkey     (rkr),
-                .is_last  (r == 14),
-                .state_out(rnd_out[r])
-            );
-            always @(posedge clk) begin
-                if (!rst_n) begin
-                    st_q[r]  <= 128'd0;
-                    aux_q[r] <= 128'd0;
-                    vld_q[r] <= 1'b0;
+            valid_out <= 1'b0;
+            if (valid_in && !rnd_busy) begin
+                st_q     <= block_in ^ rk0;
+                aux_q    <= aux_in;
+                last_q   <= last_in;
+                rnd_cnt  <= 4'd1;
+                rnd_busy <= 1'b1;
+            end else if (rnd_busy) begin
+                if (rnd_cnt == 4'd14) begin
+                    block_out <= rnd_out;
+                    aux_out   <= aux_q;
+                    last_out  <= last_q;
+                    valid_out <= 1'b1;
+                    rnd_busy  <= 1'b0;
                 end else begin
-                    st_q[r]  <= rnd_out[r];
-                    aux_q[r] <= aux_q[r-1];
-                    vld_q[r] <= vld_q[r-1];
+                    st_q    <= rnd_out;
+                    rnd_cnt <= rnd_cnt + 4'd1;
                 end
             end
         end
-    endgenerate
-
-    assign block_out = st_q[14];
-    assign aux_out   = aux_q[14];
-    assign valid_out = vld_q[14];
-
+    end
 endmodule

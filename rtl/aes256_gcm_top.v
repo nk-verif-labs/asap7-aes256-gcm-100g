@@ -73,6 +73,8 @@ module aes256_gcm_top (
     reg [127:0] aes_in_blk;
     reg [127:0] aes_in_aux;
     reg         aes_in_vld;
+    reg         aes_in_last;
+    wire        aes_out_last;
     wire [127:0] aes_out_blk;
     wire [127:0] aes_out_aux;
     wire         aes_out_vld;
@@ -87,7 +89,8 @@ module aes256_gcm_top (
     };
     wire [95:0] full_iv = {iv_regs[0], iv_regs[1], iv_regs[2]};
 
-    assign s_axis_tready = (init_state == INIT_READY) && m_axis_tready;
+    wire aes_busy;
+    assign s_axis_tready = (init_state == INIT_READY) && !aes_busy && !aes_in_vld && m_axis_tready;
 
     aes256_pipe u_aes (
         .clk      (clk),
@@ -97,22 +100,27 @@ module aes256_gcm_top (
         .key_ready(key_ready),
         .block_in (aes_in_blk),
         .aux_in   (aes_in_aux),
+        .last_in  (aes_in_last),
         .valid_in (aes_in_vld),
+        .busy     (aes_busy),
         .block_out(aes_out_blk),
         .aux_out  (aes_out_aux),
+        .last_out (aes_out_last),
         .valid_out(aes_out_vld)
     );
 
-    // GHASH combinational step
+    // Shared 4-cycle GHASH multiplier
     wire [127:0] ct_wire = aes_out_blk ^ aes_out_aux;
-    wire [127:0] gh_in_x = y_ghash ^ ct_wire;
-    wire [127:0] gh_mult_out;
-    ghash_128 u_ghash (.x_in(gh_in_x), .h_in(ghash_h), .z_out(gh_mult_out));
-
-    // Finalize tag with len(AAD)=0, len(C)=blk_cnt*128
     wire [127:0] len_blk = {64'd0, {41'd0, blk_cnt, 7'd0}};
-    wire [127:0] gh_len_out;
-    ghash_128 u_ghash_len (.x_in(gh_mult_out ^ len_blk), .h_in(ghash_h), .z_out(gh_len_out));
+    reg          gh_start, gh_last_blk, gh_final_len;
+    reg  [127:0] gh_x_in;
+    wire [127:0] gh_mult_out;
+    wire         gh_done;
+    ghash_128 u_ghash (
+        .clk(clk), .rst_n(rst_n), .start(gh_start),
+        .x_in(gh_x_in), .h_in(ghash_h),
+        .z_out(gh_mult_out), .done(gh_done)
+    );
 
     // AXI4-Lite CSRs
     reg aw_en, aw_cap, w_cap;
@@ -194,10 +202,13 @@ module aes256_gcm_top (
             aes_in_blk    <= 128'd0;
             aes_in_aux    <= 128'd0;
             aes_in_vld    <= 1'b0;
+            gh_start      <= 1'b0;
+            aes_in_last   <= 1'b0;
             ghash_h       <= 128'd0;
             ej0           <= 128'd0;
             y_ghash       <= 128'd0;
             tag_reg       <= 128'd0;
+            gh_start <= 1'b0; gh_last_blk <= 1'b0; gh_final_len <= 1'b0; gh_x_in <= 128'd0;
             tag_valid     <= 1'b0;
             ctr_val       <= 32'd2;
             blk_cnt       <= 16'd0;
@@ -207,6 +218,8 @@ module aes256_gcm_top (
             m_axis_tlast  <= 1'b0;
         end else begin
             aes_in_vld    <= 1'b0;
+            gh_start      <= 1'b0;
+            aes_in_last   <= 1'b0;
             m_axis_tvalid <= 1'b0;
             m_axis_tlast  <= 1'b0;
             tlast_pipe    <= {tlast_pipe[14:0], (init_state == INIT_READY) && s_axis_tvalid && s_axis_tready && s_axis_tlast};
@@ -250,6 +263,7 @@ module aes256_gcm_top (
                         if (s_axis_tvalid && s_axis_tready) begin
                             aes_in_blk <= {full_iv, ctr_val};
                             aes_in_aux <= s_axis_tdata;
+                            aes_in_last <= s_axis_tlast;
                             aes_in_vld <= 1'b1;
                             ctr_val    <= ctr_val + 32'd1;
                             blk_cnt    <= blk_cnt + 16'd1;
@@ -257,11 +271,23 @@ module aes256_gcm_top (
                         if (aes_out_vld) begin
                             m_axis_tdata  <= ct_wire;
                             m_axis_tvalid <= 1'b1;
-                            m_axis_tlast  <= tlast_pipe[15];
-                            y_ghash       <= gh_mult_out;
-                            if (tlast_pipe[15]) begin
-                                tag_reg   <= gh_len_out ^ ej0;
-                                tag_valid <= 1'b1;
+                            m_axis_tlast  <= aes_out_last;
+                            gh_x_in       <= y_ghash ^ ct_wire;
+                            gh_start      <= 1'b1;
+                            gh_last_blk   <= aes_out_last;
+                            gh_final_len  <= 1'b0;
+                        end
+                        if (gh_done) begin
+                            y_ghash <= gh_mult_out;
+                            if (gh_last_blk) begin
+                                gh_x_in      <= gh_mult_out ^ len_blk;
+                                gh_start     <= 1'b1;
+                                gh_last_blk  <= 1'b0;
+                                gh_final_len <= 1'b1;
+                            end else if (gh_final_len) begin
+                                tag_reg      <= gh_mult_out ^ ej0;
+                                tag_valid    <= 1'b1;
+                                gh_final_len <= 1'b0;
                             end
                         end
                     end
